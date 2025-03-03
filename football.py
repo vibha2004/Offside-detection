@@ -1,7 +1,7 @@
+
 import pygame
 import random
 import math
-import time
 
 # Initialize Pygame
 pygame.init()
@@ -9,7 +9,7 @@ pygame.init()
 # Screen dimensions
 WIDTH, HEIGHT = 800, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Football Match Simulation")
+pygame.display.set_caption("Football Match Simulation - Offside Learning Tool")
 
 # Colors
 WHITE = (255, 255, 255)
@@ -19,10 +19,12 @@ BLUE = (0, 0, 255)
 BLACK = (0, 0, 0)
 YELLOW = (255, 255, 0)
 LIGHT_GREEN = (144, 238, 144)
+ORANGE = (255, 165, 0)
 
 # Fonts
 font = pygame.font.Font(None, 36)
 small_font = pygame.font.Font(None, 24)
+tiny_font = pygame.font.Font(None, 18)
 
 # Player and Ball settings
 PLAYER_RADIUS = 10
@@ -42,14 +44,15 @@ GOAL_BOTTOM = HEIGHT // 2 + GOAL_HEIGHT // 2
 
 # Physics constants
 FRICTION = 0.97
-MAX_PLAYER_SPEED = 3
-MAX_BALL_SPEED = 8
-KICK_POWER = 7
+MAX_PLAYER_SPEED = 1.5  # Reduced player speed for easier visualization
+MAX_BALL_SPEED = 5      # Reduced ball speed
+KICK_POWER = 4          # Reduced kick power
 
 # Game states
 PLAYING = 0
 OFFSIDE_DETECTED = 1
 GOAL_SCORED = 2
+PAUSED = 3
 current_state = PLAYING
 
 # Scores
@@ -61,6 +64,9 @@ last_kicker = None
 pass_moment = None
 pass_in_progress = False
 receiver = None
+offside_line_x = None  # Initialize offside line variable
+second_last_defender = None
+offside_player = None
 
 # Debug mode
 DEBUG = False
@@ -72,6 +78,37 @@ offside_explanation = [
     "2. Player must be ahead of the ball when passed",
     "3. Player must be ahead of the second-last defender"
 ]
+
+# Button class for UI elements
+class Button:
+    def __init__(self, x, y, width, height, text, color, hover_color, action=None):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.text = text
+        self.color = color
+        self.hover_color = hover_color
+        self.action = action
+        self.is_hovered = False
+        
+    def draw(self):
+        # Draw button with hover effect
+        color = self.hover_color if self.is_hovered else self.color
+        pygame.draw.rect(screen, color, self.rect)
+        pygame.draw.rect(screen, BLACK, self.rect, 2)  # Border
+        
+        # Draw text
+        text_surf = small_font.render(self.text, True, BLACK)
+        text_rect = text_surf.get_rect(center=self.rect.center)
+        screen.blit(text_surf, text_rect)
+    
+    def check_hover(self, pos):
+        self.is_hovered = self.rect.collidepoint(pos)
+        return self.is_hovered
+        
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.is_hovered and self.action:
+                return self.action()
+        return False
 
 # Player class with realistic positioning
 class Player:
@@ -91,6 +128,7 @@ class Player:
         self.target_y = y
         self.attacking = False
         self.speed = MAX_PLAYER_SPEED * random.uniform(0.8, 1.1)  # Vary player speed
+        self.highlighted = False  # For offside visualization
 
     def euclidean_distance(self, other_x, other_y):
         """Calculate Euclidean distance to another point"""
@@ -325,8 +363,22 @@ class Player:
         # Make goalkeeper a different shade
         if self.role == "GK":
             color = (200, 50, 50) if self.team == 0 else (50, 50, 200)
-            
+        
+        # Draw player circle
         pygame.draw.circle(screen, color, (int(self.x), int(self.y)), PLAYER_RADIUS)
+        
+        # Add highlight if this player is involved in offside
+        if self.highlighted:
+            pygame.draw.circle(screen, YELLOW, (int(self.x), int(self.y)), PLAYER_RADIUS + 5, 2)
+            
+            # Add label above player
+            if self.team == receiver.team:
+                label = "OFFSIDE"
+            else:
+                label = "2nd LAST DEF"
+                
+            label_text = tiny_font.render(label, True, YELLOW)
+            screen.blit(label_text, (self.x - label_text.get_width()//2, self.y - PLAYER_RADIUS - 15))
         
         # Show team number
         number_text = small_font.render(str(self.position_id), True, WHITE)
@@ -348,8 +400,15 @@ class Ball:
         self.y = y
         self.vx = 0
         self.vy = 0
+        self.path = []  # Store positions for visualization
+        self.max_path_length = 50
 
     def move(self):
+        # Save current position for path visualization
+        self.path.append((self.x, self.y))
+        if len(self.path) > self.max_path_length:
+            self.path.pop(0)
+            
         self.x += self.vx
         self.y += self.vy
         self.vx *= FRICTION
@@ -382,82 +441,68 @@ class Ball:
         self.y = FIELD_HEIGHT / 2
         self.vx = 0
         self.vy = 0
+        self.path = []
 
     def draw(self):
+        # Draw ball path
+        for i in range(1, len(self.path)):
+            # Fade the path from white to transparent
+            alpha = int(255 * (i / len(self.path)))
+            color = (255, 255, 255, alpha)
+            pygame.draw.line(screen, color, self.path[i-1], self.path[i], 1)
+        
+        # Draw the ball
         pygame.draw.circle(screen, WHITE, (int(self.x), int(self.y)), BALL_RADIUS)
 
 # Function to check offside using Euclidean distance
 def check_offside(pass_data, receiving_player):
+    """
+    Check if the receiving player is in an offside position at the moment the ball is played.
+    """
     if not pass_data:
         return False, None, None
     
     attacking_team = pass_data['kicker'].team
     ball_x, ball_y = pass_data['ball_pos']
     
-    # Calculate Euclidean distance between ball and receiving player at time of pass
-    # d(P_b, P_r) = sqrt((x_b - x_r)^2 + (y_b - y_r)^2)
-    ball_to_receiver_dist = math.sqrt((ball_x - receiving_player.x)**2 + (ball_y - receiving_player.y)**2)
+    # Get all defenders from the opposing team (including the goalkeeper)
+    defenders = [p for p in players if p.team != attacking_team]
     
-    # Get all defenders from the opposing team
-    defenders_pos = [(x, y) for x, y, team in pass_data['player_positions'] if team != attacking_team]
+    # Sort defenders by their x-coordinate (closest to the goal)
+    if attacking_team == 0:  # Red team attacking left to right
+        defenders.sort(key=lambda p: p.x)  # Sort by x ascending
+    else:  # Blue team attacking right to left
+        defenders.sort(key=lambda p: -p.x)  # Sort by x descending
     
-    # Offside rule does not apply when:
-    # 1. Player is in their own half of the pitch
-    in_own_half = False
-    if (attacking_team == 0 and receiving_player.x <= HALF_WIDTH) or \
-       (attacking_team == 1 and receiving_player.x >= HALF_WIDTH):
-        in_own_half = True
-        return False, None, None
-    
-    # 2. Player is level with or behind the ball when it's played
-    behind_ball = False
-    if (attacking_team == 0 and receiving_player.x <= ball_x) or \
-       (attacking_team == 1 and receiving_player.x >= ball_x):
-        behind_ball = True
-        return False, None, None
-    
-    # Find the second-last defender (including goalkeeper)
-    # Sort defenders by their x position based on the attacking direction
-    if attacking_team == 0:  # Red attacking left to right
-        defenders_pos.sort(key=lambda pos: pos[0])  # Sort by x ascending
-    else:  # Blue attacking right to left
-        defenders_pos.sort(key=lambda pos: -pos[0])  # Sort by x descending
-    
-    if len(defenders_pos) < 2:
+    # The second-last defender is the offside line (last defender is usually the goalkeeper)
+    if len(defenders) < 2:
         return False, None, None  # Not enough defenders
     
-    # Get the positions of the last and second-last defenders
-    last_defender_pos = defenders_pos[0]
-    second_last_defender_pos = defenders_pos[1]
+    second_last_defender = defenders[1]
     
-    # Calculate Euclidean distance between ball and second-last defender
-    # d(P_b, P_d) = sqrt((x_b - x_d)^2 + (y_b - y_d)^2)
-    ball_to_defender_dist = math.sqrt((ball_x - second_last_defender_pos[0])**2 + 
-                                     (ball_y - second_last_defender_pos[1])**2)
+    # Offside conditions:
+    # 1. Player is in the opponent's half
+    in_opponent_half = (attacking_team == 0 and receiving_player.x > HALF_WIDTH) or \
+                       (attacking_team == 1 and receiving_player.x < HALF_WIDTH)
     
-    # Calculate Euclidean distance between receiving player and second-last defender
-    # d(P_r, P_d) = sqrt((x_r - x_d)^2 + (y_r - y_d)^2)
-    receiver_to_defender_dist = math.sqrt((receiving_player.x - second_last_defender_pos[0])**2 + 
-                                        (receiving_player.y - second_last_defender_pos[1])**2)
+    if not in_opponent_half:
+        return False, None, None  # Player is in their own half, cannot be offside
     
-    # 3. Player is level with or behind the second-last opponent
-    if attacking_team == 0:  # Red attacking left to right
-        if receiving_player.x <= second_last_defender_pos[0]:
-            return False, None, None
-    else:  # Blue attacking right to left
-        if receiving_player.x >= second_last_defender_pos[0]:
-            return False, None, None
-            
-    # Find the current second-last defender for visualization
-    current_defenders = [p for p in players if p.team != attacking_team]
-    if attacking_team == 0:
-        current_defenders.sort(key=lambda p: p.x)
-    else:
-        current_defenders.sort(key=lambda p: -p.x)
+    # 2. Player is closer to the opponent's goal line than the second-last defender
+    ahead_of_defender = (attacking_team == 0 and receiving_player.x > second_last_defender.x) or \
+                        (attacking_team == 1 and receiving_player.x < second_last_defender.x)
     
-    second_last_defender = current_defenders[1] if len(current_defenders) >= 2 else None
+    if not ahead_of_defender:
+        return False, None, None  # Player is not ahead of the second-last defender
     
-    # Player is in offside position - return distances for visualization
+    # 3. Player is closer to the opponent's goal line than the ball at the moment of the pass
+    ahead_of_ball = (attacking_team == 0 and receiving_player.x > ball_x) or \
+                    (attacking_team == 1 and receiving_player.x < ball_x)
+    
+    if not ahead_of_ball:
+        return False, None, None  # Player is not ahead of the ball
+    
+    # Player is offside if all conditions are met
     return True, second_last_defender, receiving_player
 
 # Create teams with specific formations
@@ -564,184 +609,182 @@ def draw_field():
     pygame.draw.rect(screen, WHITE, (0, GOAL_TOP, GOAL_WIDTH, GOAL_HEIGHT), 2)  # Left goal
     pygame.draw.rect(screen, WHITE, (FIELD_WIDTH - GOAL_WIDTH, GOAL_TOP, GOAL_WIDTH, GOAL_HEIGHT), 2)  # Right goal
 
+# Function to manually create offside scenario
+def setup_offside_scenario(players, ball):
+    # Place the ball in the attacking half for the red team
+    ball.x = HALF_WIDTH + 50
+    ball.y = HEIGHT // 2
+    ball.vx = 0
+    ball.vy = 0
+    
+    # Reset all players to base attributes
+    for player in players:
+        player.has_ball = False
+        player.highlighted = False
+    
+    # Get a red midfielder to be the passer
+    red_mid = next(p for p in players if p.team == 0 and p.role == "MID")
+    red_mid.x = HALF_WIDTH + 50
+    red_mid.y = HEIGHT // 2 + 50
+    red_mid.has_ball = True
+    
+    # Get a red forward to be in offside position
+    red_forward = next(p for p in players if p.team == 0 and p.role == "FWD")
+    red_forward.x = FIELD_WIDTH - 150  # Very advanced position
+    red_forward.y = HEIGHT // 2
+    
+    # Position the blue defenders to create offside trap
+    blue_defenders = [p for p in players if p.team == 1 and p.role == "DEF"]
+    for i, defender in enumerate(blue_defenders):
+        # Line up the defenders to create an offside trap
+        defender.x = FIELD_WIDTH - 250  # Create a defensive line
+        defender.y = HEIGHT//2 - 120 + 80 * i  # Spread them out
+
+    # Position blue goalkeeper behind defenders
+    blue_gk = next(p for p in players if p.team == 1 and p.role == "GK")
+    blue_gk.x = FIELD_WIDTH - 50
+    blue_gk.y = HEIGHT // 2
+
+# Function to restart the entire game
+def restart_game():
+    global current_state, score_team_red, score_team_blue, pass_in_progress
+    global last_kicker, pass_moment, receiver, offside_line_x, second_last_defender, offside_player
+    
+    # Reset game state
+    current_state = PLAYING
+    pass_in_progress = False
+    last_kicker = None
+    pass_moment = None
+    receiver = None
+    offside_line_x = None  # Reset offside line variable
+    second_last_defender = None
+    offside_player = None
+    
+    # Reset ball
+    ball.reset()
+    
+    # Reset players to their home positions
+    for player in players:
+        player.x = player.home_x
+        player.y = player.home_y
+        player.vx = 0
+        player.vy = 0
+        player.has_ball = False
+        player.highlighted = False
+    
+    return True
+
+# Function to reset after offside call
+def reset_after_offside():
+    global current_state, pass_in_progress, offside_line_x, second_last_defender, offside_player
+    
+    # Reset game state but keep score
+    current_state = PLAYING
+    pass_in_progress = False
+    offside_line_x = None
+    
+    # Reset player highlights
+    if second_last_defender:
+        second_last_defender.highlighted = False
+    if offside_player:
+        offside_player.highlighted = False
+    
+    second_last_defender = None
+    offside_player = None
+    
+    # Place ball for indirect free kick
+    if receiver:
+        ball.x = receiver.x
+        ball.y = receiver.y
+    
+    ball.vx = 0
+    ball.vy = 0
+    
+    return True
+
+# Function to toggle debug mode
+def toggle_debug():
+    global DEBUG
+    DEBUG = not DEBUG
+    return True
+
+# Draw offside visualization
+def draw_offside_visualization():
+    if offside_line_x is not None and second_last_defender and offside_player:
+        # Draw offside line at the ball's position when the pass was made
+        pygame.draw.line(screen, YELLOW, (offside_line_x, 0), (offside_line_x, HEIGHT), 2)
+        
+        # Add text explanation
+        offside_text = font.render("OFFSIDE!", True, YELLOW)
+        screen.blit(offside_text, (WIDTH//2 - offside_text.get_width()//2, 20))
+        
+        # Draw lines connecting the relevant players
+        pygame.draw.line(screen, YELLOW, (offside_player.x, offside_player.y), 
+                        (offside_player.x, HEIGHT//2), 2)
+        pygame.draw.line(screen, YELLOW, (second_last_defender.x, second_last_defender.y), 
+                        (second_last_defender.x, HEIGHT//2), 2)
+        
+        # Add explanation
+        instruction_text = small_font.render("Click 'Reset Play' to continue", True, WHITE)
+        screen.blit(instruction_text, (WIDTH//2 - instruction_text.get_width()//2, 60))
+
 # Initialize the game
+ball = Ball(WIDTH/2, HEIGHT/2)
 players = create_teams()
-ball = Ball(FIELD_WIDTH / 2, FIELD_HEIGHT / 2)
+
+# UI Buttons for interactive controls
+restart_button = Button(WIDTH - 150, 20, 120, 30, "Restart Game", ORANGE , (255, 200, 0), 
+                        lambda: restart_game())
+reset_button = Button(WIDTH - 150, 60, 120, 30, "Reset Play", ORANGE, (255, 200, 0), 
+                    lambda: reset_after_offside())
+debug_button = Button(WIDTH - 150, 100, 120, 30, "Debug Mode", ORANGE, (255, 200, 0), 
+                    lambda: toggle_debug())
 
 # Main game loop
 running = True
-clock = pygame.time.Clock()
-offside_info = None
-
-# Timer for offside simulation
-start_time = time.time()
-offside_simulated = False
-
 while running:
-    # Calculate elapsed time
-    elapsed_time = time.time() - start_time
-
-    # Simulate offside after 30 seconds
-    if not offside_simulated and elapsed_time >= 30:
-        # Force an offside scenario
-        # Move the ball and a player into an offside position
-        ball.x = HALF_WIDTH + 100  # Ball in the opponent's half
-        ball.y = HEIGHT // 2
-
-        # Move a red team player into an offside position
-        for player in players:
-            if player.team == 0 and player.role == "FWD":  # Red team forward
-                player.x = HALF_WIDTH + 150  # Ahead of the second-last defender
-                player.y = HEIGHT // 2
-                break
-
-        # Simulate a pass to the offside player
-        last_kicker = next(p for p in players if p.team == 0 and p.role == "MID")  # Red team midfielder
-        pass_moment = {
-            'kicker': last_kicker,
-            'ball_pos': (ball.x, ball.y),
-            'player_positions': [(p.x, p.y, p.team) for p in players]
-        }
-        pass_in_progress = True
-        receiver = next(p for p in players if p.team == 0 and p.role == "FWD")  # Red team forward
-
-        # Mark that offside has been simulated
-        offside_simulated = True
-
-    # Rest of the game loop remains the same
-    screen.fill(GREEN)
-
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_r:  # Reset game
-                players = create_teams()
-                ball.reset()
-                score_team_red = 0
-                score_team_blue = 0
-                current_state = PLAYING
-                last_kicker = None
-                pass_moment = None
-                pass_in_progress = False
-                receiver = None
-                start_time = time.time()  # Reset the timer
-                offside_simulated = False
-            elif event.key == pygame.K_d:  # Toggle debug mode
-                DEBUG = not DEBUG
+            
+        # Check button events
+        restart_button.handle_event(event)
+        reset_button.handle_event(event)
+        debug_button.handle_event(event)
 
-    # Draw field
-    draw_field()
-
+    # Game logic
     if current_state == PLAYING:
-        # Check for offside
-        offside_detected = False
-        offside_info = None
-
-        # Move players
+        ball_moved = ball.move()
         for player in players:
-            result = player.move(ball, players)
-            if result[0]:  # Offside detected
-                offside_detected = True
-                offside_info = result
-                break
+            player.move(ball, players)
+            if ball_moved:
+                if ball_moved:  # Check if a goal was scored
+                    if ball.x < GOAL_WIDTH:  # Red team goal
+                        score_team_blue += 1
+                        current_state = GOAL_SCORED
+                    elif ball.x > FIELD_WIDTH - GOAL_WIDTH:  # Blue team goal
+                        score_team_red += 1
+                        current_state = GOAL_SCORED
 
-        if not offside_detected:
-            # Move the ball
-            goal_scored = ball.move()
-
-            # Check for goals
-            if goal_scored:
-                if ball.x <= 0:
-                    score_team_blue += 1  # Blue team scores (right to left)
-                    current_state = GOAL_SCORED
-                    scorer = "Blue team"
-                elif ball.x >= FIELD_WIDTH:
-                    score_team_red += 1  # Red team scores (left to right)
-                    current_state = GOAL_SCORED
-                    scorer = "Red team"
-
-                # Reset for kickoff
-                ball.reset()
-                last_kicker = None
-                pass_in_progress = False
-                receiver = None
-        else:
-            current_state = OFFSIDE_DETECTED
-
-    elif current_state == OFFSIDE_DETECTED:
-        # Visualize offside line and player
-        if offside_info and offside_info[1] and offside_info[2]:
-            second_last_defender, offside_player = offside_info[1], offside_info[2]
-
-            # Draw offside line
-            pygame.draw.line(screen, YELLOW, (second_last_defender.x, 0),
-                           (second_last_defender.x, FIELD_HEIGHT), 2)
-
-            # Highlight offside player
-            pygame.draw.circle(screen, YELLOW, (int(offside_player.x), int(offside_player.y)),
-                             PLAYER_RADIUS + 5, 3)
-
-            # Show offside message
-            screen.blit(font.render("OFFSIDE!", True, YELLOW), (WIDTH // 2 - 50, 50))
-
-            # Show explanation
-            for i, line in enumerate(offside_explanation):
-                screen.blit(small_font.render(line, True, WHITE), (WIDTH // 2 - 150, 100 + i * 25))
-
-        # Game continues after a short delay
-        pygame.time.delay(2000)
-
-        # Reset for free kick
-        ball.reset()
-        last_kicker = None
-        pass_moment = None
-        pass_in_progress = False
-        receiver = None
-
-        # Return to playing state
-        current_state = PLAYING
-
-    elif current_state == GOAL_SCORED:
-        # Show goal message
-        goal_text = font.render(f"GOAL! {scorer} scores!", True, YELLOW)
-        screen.blit(goal_text, (WIDTH // 2 - 100, HEIGHT // 2 - 50))
-
-        # Update score display
-        score_text = font.render(f"Red {score_team_red} - {score_team_blue} Blue", True, WHITE)
-        screen.blit(score_text, (WIDTH // 2 - 80, 20))
-
-        # Game continues after a short delay
-        pygame.time.delay(2000)
-        current_state = PLAYING
-
-        # Reset player positions
-        for player in players:
-            player.x = player.home_x
-            player.y = player.home_y
-            player.vx = 0
-            player.vy = 0
-            player.has_ball = False
-
-    # Draw all game objects
+    # Drawing
+    draw_field()
     for player in players:
         player.draw()
-
     ball.draw()
-
-    # Display score and game info
-    score_text = font.render(f"Red {score_team_red} - {score_team_blue} Blue", True, WHITE)
-    screen.blit(score_text, (WIDTH // 2 - 80, 20))
-
-    # Display controls
-    controls_text = small_font.render("Press R to reset game | Press D to toggle debug mode", True, WHITE)
-    screen.blit(controls_text, (WIDTH // 2 - 180, HEIGHT - 30))
-
-    # Update display
+    
+    # Draw offside visualization if applicable
+    draw_offside_visualization()
+    
+    # Draw scores
+    score_text = font.render(f"Red: {score_team_red} - Blue: {score_team_blue}", True, BLACK)
+    screen.blit(score_text, (WIDTH // 2 - score_text.get_width() // 2, 10))
+    
+    # Draw buttons
+    restart_button.draw()
+    reset_button.draw()
+    debug_button.draw()
+    
     pygame.display.flip()
+    pygame.time.delay(30)
 
-    # Cap the frame rate
-    clock.tick(60)
-
-# Clean up
 pygame.quit()
